@@ -30,8 +30,17 @@ import db
 # (Render, etc.), les variables viennent du dashboard de l'hébergeur, pas
 # de ce fichier — load_dotenv() ne fait rien si .env n'existe pas, donc
 # c'est sans danger de le garder ici pour le dev local ET la prod.
+# Chemin explicite vers .env, à côté de ce fichier — fonctionne peu importe
+# le dossier depuis lequel `uvicorn main:app` est lancé. En production
+# (Render, etc.), les vraies variables viennent du dashboard de l'hébergeur
+# et sont déjà présentes dans l'environnement AVANT que ce script démarre.
+# override=False garantit qu'elles gardent toujours la priorité, même si un
+# fichier .env traîne quelque part par erreur (fichier committé par erreur,
+# résidu d'un ancien déploiement...). En local, où GROQ_API_KEY etc. ne
+# sont normalement pas déjà définies dans le shell, .env est bien chargé
+# normalement.
 ENV_PATH = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=ENV_PATH, override=True)
+load_dotenv(dotenv_path=ENV_PATH, override=False)
 
 # "parallel" (défaut) : appelle tous les providers en parallèle + fusion via LLM-juge.
 #   Meilleure qualité, mais 3-4 appels API par message (consomme les quotas gratuits plus vite).
