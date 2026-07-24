@@ -13,7 +13,7 @@ Architecture :
 """
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -23,6 +23,8 @@ from dotenv import load_dotenv
 from ai_client import ask_ai, ask_ai_fused
 from personality import build_system_prompt
 from rate_limit import SlidingWindowLimiter
+from titles import generate_title
+from image_gen import generate_image, IMAGE_MARKER
 import db
 
 # Chemin explicite vers .env, à côté de ce fichier — fonctionne peu importe
@@ -42,11 +44,14 @@ import db
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=False)
 
-# "parallel" (défaut) : appelle tous les providers en parallèle + fusion via LLM-juge.
-#   Meilleure qualité, mais 3-4 appels API par message (consomme les quotas gratuits plus vite).
-# "fallback" : un seul provider répond, les autres ne servent que de secours.
-#   Plus rapide, plus économe en quota, qualité légèrement moindre.
-FUSION_MODE = os.getenv("FUSION_MODE", "parallel").lower()
+# "fallback" (défaut) : un seul provider répond (Groq en premier, rapide),
+#   les autres ne servent que de secours si le premier échoue. Beaucoup
+#   plus rapide (généralement 1-3s), c'est le mode recommandé en usage réel.
+# "parallel" : appelle tous les providers en parallèle + fusion via LLM-juge.
+#   Meilleure qualité mais 3-4 appels API par message, largement plus lent
+#   (peut dépasser 10-20s selon la lenteur des providers secondaires) et
+#   consomme les quotas gratuits bien plus vite.
+FUSION_MODE = os.getenv("FUSION_MODE", "fallback").lower()
 
 # CORS : liste blanche des origines autorisées. En local, le frontend tourne
 # sur un port quelconque (live-server, python -m http.server, etc.) donc on
@@ -118,8 +123,20 @@ def health_check():
     return {"status": "ok", "service": "ai-orchestrator-backend"}
 
 
+async def _generate_and_store_title(session_id: str, user_message: str, reply: str) -> None:
+    """Exécuté APRÈS l'envoi de la réponse (voir background_tasks dans /chat).
+    Si ça échoue, le titre par défaut (premier message tronqué) reste en
+    place — pas grave, pas d'impact sur l'utilisateur."""
+    try:
+        smart_title = await generate_title(user_message, reply)
+        if smart_title:
+            await db.update_conversation_title(session_id, smart_title)
+    except Exception:
+        pass
+
+
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Message vide.")
 
@@ -136,9 +153,38 @@ async def chat(req: ChatRequest):
             detail=f"Doucement. Laisse-moi souffler {wait}s avant le prochain message.",
         )
 
+    stripped = req.message.strip()
+
+    # --- Commande /image : court-circuite tout le pipeline texte (pas de
+    # personnalité, pas de fusion multi-IA, pas de titre généré par LLM —
+    # rien de tout ça n'a de sens pour une image) ---
+    if stripped.lower().startswith("/image "):
+        image_prompt = stripped[len("/image "):].strip()
+        if not image_prompt:
+            raise HTTPException(
+                status_code=400,
+                detail="Décris ce que tu veux voir après /image, ex: /image un chat astronaute.",
+            )
+
+        await db.ensure_conversation(req.session_id, first_message=f"Image : {image_prompt}")
+
+        try:
+            data_url = await generate_image(image_prompt)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Erreur génération d'image : {str(e)}")
+
+        reply = f"{IMAGE_MARKER}{data_url}"
+
+        await db.add_message(req.session_id, "user", req.message)
+        await db.add_message(req.session_id, "assistant", reply)
+
+        meta = await db.get_conversation_meta(req.session_id)
+        title = meta["title"] if meta else "Nouvelle conversation"
+        return ChatResponse(reply=reply, session_id=req.session_id, title=title)
+
     # Crée la conversation en DB si c'est le premier message de cette session
-    # (le titre est dérivé de ce premier message).
-    await db.ensure_conversation(req.session_id, first_message=req.message)
+    # (titre par défaut = premier message tronqué, remplacé plus bas si neuf).
+    is_new_conversation = await db.ensure_conversation(req.session_id, first_message=req.message)
 
     # Contexte envoyé au LLM : les 20 derniers messages de CETTE conversation.
     history = await db.get_history(req.session_id, limit=20)
@@ -156,6 +202,13 @@ async def chat(req: ChatRequest):
 
     await db.add_message(req.session_id, "user", req.message)
     await db.add_message(req.session_id, "assistant", reply)
+
+    # Titre IA généré en tâche de fond, APRÈS avoir renvoyé la réponse —
+    # ne bloque plus la latence perçue. Le tout premier message d'une
+    # conversation affiche donc le titre tronqué par défaut, remplacé par
+    # le vrai titre IA au prochain rechargement / message.
+    if is_new_conversation:
+        background_tasks.add_task(_generate_and_store_title, req.session_id, req.message, reply)
 
     meta = await db.get_conversation_meta(req.session_id)
     title = meta["title"] if meta else "Nouvelle conversation"

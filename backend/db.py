@@ -14,13 +14,17 @@ chaque requête — adapté à FastAPI (async natif), contrairement au pattern
 trop coûteux en latence réseau (chaque connexion = un aller-retour TCP/TLS
 vers un serveur distant, pas un fichier local).
 
-Connexion : utilise l'URI de connexion DIRECTE de Supabase (port 5432,
-PAS le pooler PgBouncer sur le port 6543). La distinction compte : le
-pooler Supavisor est fait pour les environnements serverless qui ouvrent
-plein de connexions courtes (Vercel functions, etc.) ; nous, on est un
-process persistant (Render) qui gère déjà son propre pool en interne côté
-appli — la connexion directe est donc le bon choix ici, plus simple et
-sans couche d'indirection en trop.
+Connexion : utilise le "Session pooler" de Supabase (Supavisor), pas la
+connexion directe. Deux raisons :
+1. La connexion directe de Supabase est IPv6 par défaut (sauf option IPv4
+   payante) — risque de ne pas fonctionner selon l'hébergeur du backend.
+   Le Session pooler, lui, est garanti IPv4 sur toutes les offres.
+2. Le mode "session" (par opposition au mode "transaction", pensé pour du
+   serverless/edge) maintient des connexions façon connexion classique —
+   adapté à un process persistant comme le nôtre (Render), qui gère déjà
+   son propre pool en interne côté appli.
+Dans le dashboard Supabase : bouton "Connect" (en haut du projet) ->
+onglet "Session pooler" -> copier l'URI.
 
 IMPORTANT — confidentialité (inchangé depuis la version SQLite) :
 Toujours aucun endpoint qui liste toutes les conversations, tous
@@ -31,6 +35,7 @@ conversation.
 import os
 import asyncpg
 from datetime import datetime, timezone
+from image_gen import IMAGE_MARKER
 
 _pool: asyncpg.Pool | None = None
 
@@ -82,24 +87,37 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def ensure_conversation(session_id: str, first_message: str | None = None) -> None:
-    """Crée la conversation si elle n'existe pas encore. Le titre vient du
-    premier message utilisateur, tronqué à 60 caractères."""
+async def ensure_conversation(session_id: str, first_message: str | None = None) -> bool:
+    """Crée la conversation si elle n'existe pas encore. Le titre par défaut
+    vient du premier message utilisateur, tronqué à 60 caractères — sera
+    remplacé par un vrai titre généré par IA juste après (voir main.py).
+    Retourne True si la conversation vient d'être créée, False si elle
+    existait déjà (utile pour savoir s'il faut générer un titre IA)."""
     async with _pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT session_id FROM conversations WHERE session_id = $1", session_id
         )
-        if row is None:
-            title = "Nouvelle conversation"
-            if first_message:
-                cleaned = first_message.strip().replace("\n", " ")
-                title = cleaned[:60] + ("…" if len(cleaned) > 60 else "")
-            now = _now()
-            await conn.execute(
-                "INSERT INTO conversations (session_id, title, created_at, updated_at) "
-                "VALUES ($1, $2, $3, $4)",
-                session_id, title, now, now,
-            )
+        if row is not None:
+            return False
+
+        title = "Nouvelle conversation"
+        if first_message:
+            cleaned = first_message.strip().replace("\n", " ")
+            title = cleaned[:60] + ("…" if len(cleaned) > 60 else "")
+        now = _now()
+        await conn.execute(
+            "INSERT INTO conversations (session_id, title, created_at, updated_at) "
+            "VALUES ($1, $2, $3, $4)",
+            session_id, title, now, now,
+        )
+        return True
+
+
+async def update_conversation_title(session_id: str, title: str) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE conversations SET title = $1 WHERE session_id = $2", title, session_id
+        )
 
 
 async def add_message(session_id: str, role: str, content: str) -> None:
@@ -116,7 +134,10 @@ async def add_message(session_id: str, role: str, content: str) -> None:
 
 async def get_history(session_id: str, limit: int = 20) -> list[dict]:
     """Les `limit` derniers messages, dans l'ordre chronologique, prêts à
-    être envoyés au LLM comme contexte de conversation."""
+    être envoyés au LLM comme contexte de conversation. Les images (qui
+    pèsent 1-2 Mo en base64 chacune) sont remplacées par un court
+    placeholder texte — jamais envoyées telles quelles à un LLM de texte,
+    ça gaspillerait des tokens pour rien et pourrait faire planter l'appel."""
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -129,7 +150,13 @@ async def get_history(session_id: str, limit: int = 20) -> list[dict]:
             """,
             session_id, limit,
         )
-        return [{"role": r["role"], "content": r["content"]} for r in rows]
+        result = []
+        for r in rows:
+            content = r["content"]
+            if content.startswith(IMAGE_MARKER):
+                content = "[Soren a généré une image ici]"
+            result.append({"role": r["role"], "content": content})
+        return result
 
 
 async def get_full_conversation(session_id: str) -> dict | None:

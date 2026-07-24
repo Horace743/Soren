@@ -5,11 +5,19 @@
 const IS_LOCAL = ["localhost", "127.0.0.1"].includes(window.location.hostname);
 const API_URL = IS_LOCAL
   ? "http://127.0.0.1:8000"
-  : "https://soren-eulu.onrender.com"; // <-- à remplacer une fois déployé sur Render
+  : "https://TON-BACKEND.onrender.com"; // <-- à remplacer une fois déployé sur Render
 
 const STATUS_CHECK_INTERVAL_MS = 15000;
 const LOCAL_LIST_KEY = "soren_conversations";
 const CURRENT_SESSION_KEY = "soren_current_session";
+const IMAGE_MARKER = "@@SOREN_IMAGE@@";
+const THINKING_PHRASES = [
+  "Réflexion...",
+  "Analyse en cours...",
+  "Je fouille mes neurones...",
+  "Ça mijote...",
+  "Connexion aux cerveaux...",
+];
 
 const chatWindow = document.getElementById("chat-window");
 const chatForm = document.getElementById("chat-form");
@@ -18,7 +26,6 @@ const sendBtn = document.getElementById("send-btn");
 const clearBtn = document.getElementById("clear-btn");
 const orb = document.getElementById("orb");
 const tagline = document.getElementById("tagline");
-const typingRow = document.getElementById("typing-row");
 
 const historyBtn = document.getElementById("history-btn");
 const historyCloseBtn = document.getElementById("history-close-btn");
@@ -148,7 +155,7 @@ historyCloseBtn.addEventListener("click", closeHistoryPanel);
 historyBackdrop.addEventListener("click", closeHistoryPanel);
 
 // ============================================================
-// Rendu des messages (identique à avant : blocs de code, gras, inline code)
+// Rendu du contenu des messages (blocs de code, gras, inline code, images)
 // ============================================================
 function timestamp(isoString) {
   const d = isoString ? new Date(isoString) : new Date();
@@ -251,24 +258,40 @@ function renderMessageContent(container, text) {
   return hasCode;
 }
 
-function addMessage(role, text, opts = {}) {
+function appendImageBlock(container, dataUrl) {
   const wrapper = document.createElement("div");
-  wrapper.className = `message ${role}`;
+  wrapper.className = "image-block";
+  const img = document.createElement("img");
+  img.src = dataUrl;
+  img.alt = "Image générée par Soren";
+  img.loading = "lazy";
+  wrapper.appendChild(img);
+  container.appendChild(wrapper);
+}
 
-  const bubble = document.createElement("div");
-  bubble.className = "bubble";
-  if (opts.pending) bubble.classList.add("pending");
+// Remplit une bulle assistant déjà existante avec le contenu final (texte,
+// code, ou image). Utilisée à la fois pour un nouveau message assistant et
+// pour transformer une bulle "en attente" en réponse réelle, SUR PLACE —
+// pas de nouvel élément créé, pas de saut visuel.
+function fillAssistantBubble(bubble, text, opts = {}) {
+  bubble.innerHTML = "";
+  bubble.classList.remove("pending", "error", "rate-limited", "image-bubble");
   if (opts.error) bubble.classList.add("error");
   if (opts.rateLimited) bubble.classList.add("rate-limited");
 
+  const isImage = text.startsWith(IMAGE_MARKER);
   let hasCode = false;
-  if (role === "assistant" && !opts.pending && !opts.error && !opts.rateLimited) {
+
+  if (isImage) {
+    bubble.classList.add("image-bubble");
+    appendImageBlock(bubble, text.slice(IMAGE_MARKER.length));
+  } else if (!opts.error && !opts.rateLimited) {
     hasCode = renderMessageContent(bubble, text);
   } else {
     bubble.textContent = text;
   }
 
-  if (role === "assistant" && !opts.pending && !hasCode) {
+  if (!opts.error && !opts.rateLimited && !hasCode && !isImage) {
     const copyBtn = document.createElement("button");
     copyBtn.className = "copy-btn";
     copyBtn.type = "button";
@@ -284,6 +307,20 @@ function addMessage(role, text, opts = {}) {
       });
     });
     bubble.appendChild(copyBtn);
+  }
+}
+
+function addMessage(role, text, opts = {}) {
+  const wrapper = document.createElement("div");
+  wrapper.className = `message ${role}`;
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+
+  if (role === "assistant") {
+    fillAssistantBubble(bubble, text, opts);
+  } else {
+    bubble.textContent = text;
   }
 
   const time = document.createElement("span");
@@ -302,49 +339,95 @@ function showWelcomeMessage() {
   addMessage("assistant", "Bon. Je t'écoute. Essaie d'être clair, pour une fois.");
 }
 
-function setThinking(isThinking) {
-  typingRow.hidden = !isThinking;
-  orb.classList.toggle("thinking", isThinking);
-  if (isThinking) chatWindow.scrollTop = chatWindow.scrollHeight;
+// ============================================================
+// Bulle "en train de réfléchir" — apparaît directement à la position où
+// la vraie réponse va s'afficher (dernier message de la liste), et se
+// transforme sur place une fois la réponse prête. Pas d'indicateur séparé
+// ailleurs sur la page.
+// ============================================================
+function randomThinkingPhrase() {
+  return THINKING_PHRASES[Math.floor(Math.random() * THINKING_PHRASES.length)];
+}
+
+function addPendingMessage() {
+  const wrapper = document.createElement("div");
+  wrapper.className = "message assistant";
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble pending";
+
+  const statusText = document.createElement("span");
+  statusText.className = "pending-status";
+  statusText.textContent = randomThinkingPhrase();
+
+  const dots = document.createElement("span");
+  dots.className = "typing-dots";
+  dots.innerHTML = "<span></span><span></span><span></span>";
+
+  bubble.appendChild(statusText);
+  bubble.appendChild(dots);
+
+  const time = document.createElement("span");
+  time.className = "timestamp";
+  time.textContent = timestamp();
+
+  wrapper.appendChild(bubble);
+  wrapper.appendChild(time);
+  chatWindow.appendChild(wrapper);
+  chatWindow.scrollTop = chatWindow.scrollHeight;
+
+  // Fait tourner les phrases pour les réponses un peu longues à arriver,
+  // plutôt que de laisser un mot statique.
+  const rotationId = setInterval(() => {
+    statusText.textContent = randomThinkingPhrase();
+  }, 1800);
+
+  return { bubble, rotationId };
 }
 
 // ============================================================
 // Chargement / changement de conversation
 // ============================================================
-async function loadConversation(sessionId) {
-  chatWindow.innerHTML = "";
+async function loadConversation(sessionId, opts = {}) {
+  const isSwitch = opts.isSwitch === true;
+
+  // Sur un changement explicite de conversation (panneau d'historique), on
+  // vide tout de suite — le message d'accueil sert de placeholder pendant
+  // le chargement. Au premier chargement de page en revanche, on ne touche
+  // à RIEN : le message d'accueil déjà présent dans le HTML reste affiché
+  // tel quel jusqu'à ce qu'on ait de vraies données, pour ne jamais montrer
+  // un écran vide pendant qu'on attend le réseau (le backend Render peut
+  // mettre plusieurs secondes à se réveiller après une mise en veille).
+  if (isSwitch) {
+    showWelcomeMessage();
+  }
+
   try {
     const res = await fetch(`${API_URL}/conversations/${sessionId}`);
-    if (res.status === 404) {
-      // Conversation pas encore commencée côté serveur (nouvelle session) : écran d'accueil.
-      showWelcomeMessage();
-      return;
+    if (res.status === 404 || !res.ok) {
+      return; // l'accueil (ou le placeholder) déjà affiché reste correct
     }
-    if (!res.ok) throw new Error(`Erreur serveur (${res.status})`);
 
     const conv = await res.json();
-    if (conv.messages.length === 0) {
-      showWelcomeMessage();
-      return;
-    }
+    if (conv.messages.length === 0) return;
+
+    chatWindow.innerHTML = "";
     for (const m of conv.messages) {
       addMessage(m.role, m.content, { createdAt: m.created_at });
     }
     upsertLocalEntry(sessionId, conv.title);
   } catch (err) {
-    showWelcomeMessage();
-    addMessage(
-      "assistant",
-      `Erreur au chargement de la conversation : ${err.message}. Vérifie que le backend tourne sur ${API_URL}.`,
-      { error: true }
-    );
+    // Réseau indisponible (backend qui se réveille, coupure...) : on garde
+    // ce qui est déjà affiché plutôt que d'agresser l'utilisateur avec une
+    // erreur au premier chargement. L'orbe reflète séparément le statut de
+    // connexion si le problème persiste.
   }
 }
 
 async function switchToConversation(sessionId) {
   setCurrentSessionId(sessionId);
   closeHistoryPanel();
-  await loadConversation(sessionId);
+  await loadConversation(sessionId, { isSwitch: true });
   renderHistoryList();
 }
 
@@ -374,7 +457,9 @@ async function deleteConversation(sessionId) {
 // ============================================================
 async function sendMessage(message) {
   addMessage("user", message);
-  setThinking(true);
+
+  const { bubble: pendingBubble, rotationId } = addPendingMessage();
+  orb.classList.add("thinking");
 
   sendBtn.disabled = true;
   input.disabled = true;
@@ -394,16 +479,18 @@ async function sendMessage(message) {
     }
 
     const data = await res.json();
-    setThinking(false);
-    addMessage("assistant", data.reply);
+    clearInterval(rotationId);
+    orb.classList.remove("thinking");
+    fillAssistantBubble(pendingBubble, data.reply);
     upsertLocalEntry(currentSessionId, data.title);
   } catch (err) {
-    setThinking(false);
+    clearInterval(rotationId);
+    orb.classList.remove("thinking");
     if (err.status === 429) {
-      addMessage("assistant", err.message, { rateLimited: true });
+      fillAssistantBubble(pendingBubble, err.message, { rateLimited: true });
     } else {
-      addMessage(
-        "assistant",
+      fillAssistantBubble(
+        pendingBubble,
         `Erreur : ${err.message}. Vérifie que le backend tourne sur ${API_URL}.`,
         { error: true }
       );
@@ -460,8 +547,9 @@ checkBackendStatus();
 setInterval(checkBackendStatus, STATUS_CHECK_INTERVAL_MS);
 
 // ============================================================
-// Initialisation : reprend la conversation en cours (si elle existe déjà
-// côté serveur) ou affiche l'écran d'accueil.
+// Initialisation : le message d'accueil (déjà dans le HTML) s'affiche
+// immédiatement, sans attendre le réseau. loadConversation() le remplacera
+// SEULEMENT s'il trouve une vraie conversation existante côté serveur.
 // ============================================================
 currentSessionId = getCurrentSessionId();
 loadConversation(currentSessionId);

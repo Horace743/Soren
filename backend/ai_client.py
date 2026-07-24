@@ -15,6 +15,11 @@ constante correspondante (GROQ_MODEL, OPENROUTER_MODEL, HF_MODEL).
 automatiquement sur le suivant en cas d'échec — c'est la fonction que le
 reste du backend doit utiliser (pas les fonctions individuelles, sauf besoin
 spécifique).
+
+Timeout par provider : 12s (resserré depuis 30s suite à des retours
+utilisateurs sur la lenteur des réponses). Un provider qui met plus de 12s
+est traité comme en échec — le fallback (ou la fusion) prend le relais
+plutôt que de faire attendre tout le monde pour un seul provider lent.
 """
 
 import os
@@ -50,7 +55,7 @@ async def ask_groq(messages: list[dict], temperature: float = 0.8) -> str:
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=8.0) as client:
         response = await client.post(GROQ_URL, json=payload, headers=headers)
 
     if response.status_code != 200:
@@ -88,7 +93,7 @@ async def ask_openrouter(messages: list[dict], temperature: float = 0.8) -> str:
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=8.0) as client:
         response = await client.post(OPENROUTER_URL, json=payload, headers=headers)
 
     if response.status_code != 200:
@@ -127,7 +132,7 @@ async def ask_huggingface(messages: list[dict], temperature: float = 0.8) -> str
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=8.0) as client:
         response = await client.post(HF_URL, json=payload, headers=headers)
 
     if response.status_code != 200:
@@ -144,6 +149,12 @@ async def ask_huggingface(messages: list[dict], temperature: float = 0.8) -> str
 # Si un provider échoue (clé manquante, modèle disparu, rate limit,
 # timeout...), le suivant prend le relais automatiquement. L'utilisateur
 # ne voit une erreur que si LES TROIS ont échoué.
+# Borne dure au niveau du routeur, EN PLUS du timeout httpx interne à
+# chaque provider (12s aussi) — double filet de sécurité : même si un futur
+# provider oublie de configurer son propre timeout réseau, il ne pourra
+# jamais bloquer la réponse au-delà de cette limite.
+PROVIDER_TIMEOUT_SECONDS = 8
+
 PROVIDER_CHAIN = [
     ("groq", ask_groq),
     ("openrouter", ask_openrouter),
@@ -156,7 +167,9 @@ async def ask_ai(messages: list[dict], temperature: float = 0.8) -> str:
 
     for name, provider_fn in PROVIDER_CHAIN:
         try:
-            return await provider_fn(messages, temperature)
+            return await asyncio.wait_for(
+                provider_fn(messages, temperature), timeout=PROVIDER_TIMEOUT_SECONDS
+            )
         except Exception as e:
             errors.append(str(e))
             continue
