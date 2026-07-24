@@ -5,7 +5,7 @@
 const IS_LOCAL = ["localhost", "127.0.0.1"].includes(window.location.hostname);
 const API_URL = IS_LOCAL
   ? "http://127.0.0.1:8000"
-  : "https://soren-eulu.onrender.com/"; // <-- à remplacer une fois déployé sur Render
+  : "https://soren-eulu.onrender.com"; // <-- à remplacer une fois déployé sur Render
 
 const STATUS_CHECK_INTERVAL_MS = 15000;
 const LOCAL_LIST_KEY = "soren_conversations";
